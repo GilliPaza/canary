@@ -169,6 +169,11 @@ class PlayerFunctions {
 	static int luaPlayerGetStamina(lua_State* L);
 	static int luaPlayerSetStamina(lua_State* L);
 
+	static int luaPlayerIsTotpEnabled(lua_State* L);
+	static int luaPlayerSetupTotp(lua_State* L);
+	static int luaPlayerConfirmTotp(lua_State* L);
+	static int luaPlayerDisableTotp(lua_State* L);
+
 	static int luaPlayerGetSoul(lua_State* L);
 	static int luaPlayerAddSoul(lua_State* L);
 	static int luaPlayerGetMaxSoul(lua_State* L);

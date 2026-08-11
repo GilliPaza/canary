@@ -123,6 +123,12 @@ public:
 	void setHouseBidId(uint32_t houseId);
 	uint32_t getHouseBidId() const;
 
+	// Two-factor authentication (TOTP)
+	[[nodiscard]] std::string getTotpSecret() const;
+	void setTotpSecret(const std::string &secret);
+	[[nodiscard]] bool isTotpEnabled() const;
+	void setTotpEnabled(bool enabled);
+
 	// Old protocol compat
 	void setProtocolCompat(bool toggle);
 

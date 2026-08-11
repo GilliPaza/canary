@@ -31,8 +31,9 @@ public:
 
 private:
 	void disconnectClient(const std::string &message) const;
+	void disconnectClientInvalidToken() const;
 
-	void getCharacterList(const std::string &accountDescriptor, const std::string &password) const;
+	void getCharacterList(const std::string &accountDescriptor, const std::string &password, const std::string &token) const;
 	void getLivestreamCharacterList(const std::string &password) const;
 
 	bool oldProtocol = false;

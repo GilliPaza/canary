@@ -20,6 +20,7 @@
 #include "game/game.hpp"
 #include "core.hpp"
 #include "enums/account_errors.hpp"
+#include "utils/tools.hpp"
 
 void ProtocolLogin::disconnectClient(const std::string &message) const {
 	const auto output = OutputMessagePool::getOutputMessage();
@@ -31,7 +32,20 @@ void ProtocolLogin::disconnectClient(const std::string &message) const {
 	disconnect();
 }
 
-void ProtocolLogin::getCharacterList(const std::string &accountDescriptor, const std::string &password) const {
+// LoginServerTokenError (13, see modules/gamelib/protocollogin.lua on the
+// client) - the client already shows "Invalid authenticator token." on its
+// own for this opcode, so the only payload is a single filler byte.
+void ProtocolLogin::disconnectClientInvalidToken() const {
+	const auto output = OutputMessagePool::getOutputMessage();
+
+	output->addByte(0x0D);
+	output->addByte(0x00);
+	send(output);
+
+	disconnect();
+}
+
+void ProtocolLogin::getCharacterList(const std::string &accountDescriptor, const std::string &password, const std::string &token) const {
 	Account account(accountDescriptor);
 	account.setProtocolCompat(oldProtocol);
 
@@ -47,6 +61,11 @@ void ProtocolLogin::getCharacterList(const std::string &accountDescriptor, const
 		std::ostringstream ss;
 		ss << (oldProtocol ? "Username" : "Email") << " or password is not correct.";
 		disconnectClient(ss.str());
+		return;
+	}
+
+	if (account.isTotpEnabled() && !verifyTotpToken(account.getTotpSecret(), token)) {
+		disconnectClientInvalidToken();
 		return;
 	}
 
@@ -122,6 +141,7 @@ void ProtocolLogin::onRecvFirstMessage(NetworkMessage &msg) {
 	 - 1 byte: preview world(971+)
 	 */
 
+	const uint32_t rsaBlock1Start = msg.getBufferPosition();
 	if (!Protocol::RSA_decrypt(msg)) {
 		g_logger().warn("[ProtocolLogin::onRecvFirstMessage] - RSA Decrypt Failed");
 		disconnect();
@@ -194,9 +214,37 @@ void ProtocolLogin::onRecvFirstMessage(NetworkMessage &msg) {
 		return;
 	}
 
+	// The account/password read above only consumes as many bytes as their
+	// content needs, not the full 128-byte RSA block (the rest is random
+	// padding). Skip to the actual end of the block before reading anything
+	// else, or every read past this point would be misaligned.
+	constexpr uint32_t RSA_BLOCK_SIZE = 128;
+	msg.skipBytes(static_cast<int16_t>(RSA_BLOCK_SIZE - (msg.getBufferPosition() - rsaBlock1Start)));
+
+	// GameOGLInformation (client feature, enabled since protocol 1061): two
+	// filler bytes followed by GPU vendor/renderer and GL version, sent in
+	// the clear (not part of either RSA block). Must be consumed here or
+	// the second RSA block below would be read from the wrong offset.
+	msg.skipBytes(2);
+	msg.getString(); // GPU vendor + renderer
+	msg.getString(); // GL version
+
+	// GameAuthenticator (client feature, enabled since protocol 1072): a
+	// second, separate RSA-encrypted block containing the TOTP token, sent
+	// unconditionally by the client - empty when the player has no 2FA
+	// token to provide. See Client/otclient-main/modules/gamelib/protocollogin.lua.
+	// Protocol::RSA_decrypt() already validates and consumes the leading
+	// zero byte internally (mirrors the first RSA block above, where the
+	// XTEA key is read immediately after RSA_decrypt with no extra byte
+	// skipped) - the token string starts right after it.
+	std::string token;
+	if (Protocol::RSA_decrypt(msg)) {
+		token = msg.getString();
+	}
+
 	g_dispatcher().addEvent(
-		[self = std::static_pointer_cast<ProtocolLogin>(shared_from_this()), accountDescriptor, password] {
-			self->getCharacterList(accountDescriptor, password);
+		[self = std::static_pointer_cast<ProtocolLogin>(shared_from_this()), accountDescriptor, password, token] {
+			self->getCharacterList(accountDescriptor, password, token);
 		},
 		__FUNCTION__
 	);

@@ -26,13 +26,13 @@ AccountRepositoryDB::AccountRepositoryDB() {
 }
 
 bool AccountRepositoryDB::loadByID(const uint32_t &id, std::unique_ptr<AccountInfo> &acc) {
-	auto query = fmt::format("SELECT `id`, `type`, `premdays`, `lastday`, `creation`, `premdays_purchased`, 0 AS `expires` FROM `accounts` WHERE `id` = {}", id);
+	auto query = fmt::format("SELECT `id`, `type`, `premdays`, `lastday`, `creation`, `premdays_purchased`, `totp_secret`, `totp_enabled`, 0 AS `expires` FROM `accounts` WHERE `id` = {}", id);
 	return load(query, acc);
 };
 
 bool AccountRepositoryDB::loadByEmailOrName(bool oldProtocol, const std::string &emailOrName, std::unique_ptr<AccountInfo> &acc) {
 	auto identifier = oldProtocol ? "name" : "email";
-	auto query = fmt::format("SELECT `id`, `type`, `premdays`, `lastday`, `creation`, `premdays_purchased`, 0 AS `expires` FROM `accounts` WHERE `{}` = {}", identifier, g_database().escapeString(emailOrName));
+	auto query = fmt::format("SELECT `id`, `type`, `premdays`, `lastday`, `creation`, `premdays_purchased`, `totp_secret`, `totp_enabled`, 0 AS `expires` FROM `accounts` WHERE `{}` = {}", identifier, g_database().escapeString(emailOrName));
 	return load(query, acc);
 };
 
@@ -40,7 +40,7 @@ bool AccountRepositoryDB::loadBySession(const std::string &sessionKey, std::uniq
 	const auto escapedSessionId = g_database().escapeString(transformToSHA256(sessionKey));
 	const auto escapedLegacySessionId = g_database().escapeString(transformToSHA1(sessionKey));
 	auto query = fmt::format(
-		"SELECT `accounts`.`id`, `type`, `premdays`, `lastday`, `creation`, `premdays_purchased`, `account_sessions`.`expires` "
+		"SELECT `accounts`.`id`, `type`, `premdays`, `lastday`, `creation`, `premdays_purchased`, `totp_secret`, `totp_enabled`, `account_sessions`.`expires` "
 		"FROM `accounts` "
 		"INNER JOIN `account_sessions` ON `account_sessions`.`account_id` = `accounts`.`id` "
 		"WHERE `account_sessions`.`id` IN ({}, {}) "
@@ -55,13 +55,15 @@ bool AccountRepositoryDB::loadBySession(const std::string &sessionKey, std::uniq
 bool AccountRepositoryDB::save(const std::unique_ptr<AccountInfo> &accInfo) {
 	bool successful = g_database().executeQuery(
 		fmt::format(
-			"UPDATE `accounts` SET `type` = {}, `premdays` = {}, `lastday` = {}, `creation` = {}, `premdays_purchased` = {}, `house_bid_id` = {} WHERE `id` = {}",
+			"UPDATE `accounts` SET `type` = {}, `premdays` = {}, `lastday` = {}, `creation` = {}, `premdays_purchased` = {}, `house_bid_id` = {}, `totp_secret` = {}, `totp_enabled` = {} WHERE `id` = {}",
 			accInfo->accountType,
 			accInfo->premiumRemainingDays,
 			accInfo->premiumLastDay,
 			accInfo->creationTime,
 			accInfo->premiumDaysPurchased,
 			accInfo->houseBidId,
+			accInfo->totpSecret.empty() ? "NULL" : g_database().escapeString(accInfo->totpSecret),
+			accInfo->totpEnabled ? 1 : 0,
 			accInfo->id
 		)
 	);
@@ -295,6 +297,8 @@ bool AccountRepositoryDB::load(const std::string &query, std::unique_ptr<Account
 	acc->sessionExpires = result->getNumber<time_t>("expires");
 	acc->premiumDaysPurchased = result->getNumber<uint32_t>("premdays_purchased");
 	acc->creationTime = result->getNumber<uint32_t>("creation");
+	acc->totpSecret = result->getString("totp_secret");
+	acc->totpEnabled = result->getNumber<uint16_t>("totp_enabled") != 0;
 	acc->premiumRemainingDays = acc->premiumLastDay > getTimeNow() ? (acc->premiumLastDay - getTimeNow()) / 86400 : 0;
 
 	setupLoyaltyInfo(acc);

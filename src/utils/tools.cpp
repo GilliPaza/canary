@@ -296,6 +296,77 @@ std::string generateToken(const std::string &key, uint32_t ticks) {
 	return message;
 }
 
+bool verifyTotpToken(const std::string &base32Secret, const std::string &token) {
+	if (base32Secret.empty() || token.empty()) {
+		return false;
+	}
+
+	const std::string secret = base32Decode(base32Secret);
+	const uint32_t currentTicks = static_cast<uint32_t>(getTimeNow() / 30);
+	for (int32_t drift = -1; drift <= 1; ++drift) {
+		if (generateToken(secret, currentTicks + drift) == token) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+std::string generateTotpSecret() {
+	std::string secret(10, 0);
+	for (auto &byte : secret) {
+		byte = static_cast<char>(uniform_random(0, 255));
+	}
+	return secret;
+}
+
+std::string base32Encode(const std::string &input) {
+	static constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+	std::string output;
+	output.reserve((input.size() * 8 + 4) / 5);
+
+	uint32_t buffer = 0;
+	int32_t bitsLeft = 0;
+	for (const unsigned char byte : input) {
+		buffer = (buffer << 8) | byte;
+		bitsLeft += 8;
+		while (bitsLeft >= 5) {
+			bitsLeft -= 5;
+			output.push_back(alphabet[(buffer >> bitsLeft) & 0x1F]);
+		}
+	}
+
+	if (bitsLeft > 0) {
+		output.push_back(alphabet[(buffer << (5 - bitsLeft)) & 0x1F]);
+	}
+
+	return output;
+}
+
+std::string base32Decode(const std::string &input) {
+	static constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+	std::string output;
+	output.reserve(input.size() * 5 / 8);
+
+	uint32_t buffer = 0;
+	int32_t bitsLeft = 0;
+	for (const char c : input) {
+		const auto pos = alphabet.find(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+		if (pos == std::string_view::npos) {
+			continue;
+		}
+
+		buffer = (buffer << 5) | static_cast<uint32_t>(pos);
+		bitsLeft += 5;
+		if (bitsLeft >= 8) {
+			bitsLeft -= 8;
+			output.push_back(static_cast<char>((buffer >> bitsLeft) & 0xFF));
+		}
+	}
+
+	return output;
+}
+
 void replaceString(std::string &str, const std::string &sought, const std::string &replacement) {
 	if (str.empty() || sought.empty()) {
 		return;

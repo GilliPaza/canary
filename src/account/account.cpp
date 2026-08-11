@@ -326,3 +326,16 @@ uint32_t Account::getHouseBidId() const {
 void Account::setHouseBidId(uint32_t houseId) {
 	m_account->houseBidId = houseId;
 }
+
+std::string Account::getTotpSecret() const {
+	return m_account->totpSecret;
+}
+void Account::setTotpSecret(const std::string &secret) {
+	m_account->totpSecret = secret;
+}
+bool Account::isTotpEnabled() const {
+	return m_account->totpEnabled;
+}
+void Account::setTotpEnabled(bool enabled) {
+	m_account->totpEnabled = enabled;
+}

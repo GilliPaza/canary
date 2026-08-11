@@ -55,6 +55,24 @@ void printXMLError(const std::string &where, const std::string &fileName, const 
 
 [[nodiscard]] std::string generateToken(const std::string &secret, uint32_t ticks);
 
+// Verifies a 6-digit TOTP code against the given base32-encoded secret
+// (as stored in accounts.totp_secret), tolerating a +-1 30-second step of
+// clock drift between server and authenticator app.
+[[nodiscard]] bool verifyTotpToken(const std::string &base32Secret, const std::string &token);
+
+// Generates a new random raw TOTP secret (10 bytes / 80 bits of entropy).
+[[nodiscard]] std::string generateTotpSecret();
+
+// RFC 4648 base32 encoding, used both to show a TOTP secret in the format
+// authenticator apps (Google Authenticator, etc.) expect for manual entry,
+// and to store it as ASCII text (accounts.totp_secret is utf8mb3, which
+// would reject/corrupt the raw random secret bytes).
+[[nodiscard]] std::string base32Encode(const std::string &input);
+
+// RFC 4648 base32 decoding, the inverse of base32Encode. Non-alphabet
+// characters are ignored.
+[[nodiscard]] std::string base32Decode(const std::string &input);
+
 void replaceString(std::string &str, const std::string &sought, const std::string &replacement);
 void trim_right(std::string &source, char t);
 void trim_left(std::string &source, char t);

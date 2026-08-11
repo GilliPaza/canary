@@ -23,6 +23,7 @@
 #include "game/scheduling/save_manager.hpp"
 #include "io/iobestiary.hpp"
 #include "io/iologindata.hpp"
+#include "utils/tools.hpp"
 #include "io/ioprey.hpp"
 #include "items/containers/depot/depotchest.hpp"
 #include "items/containers/depot/depotlocker.hpp"
@@ -262,6 +263,11 @@ void PlayerFunctions::init(lua_State* L) {
 
 	Lua::registerMethod(L, "Player", "getStamina", PlayerFunctions::luaPlayerGetStamina);
 	Lua::registerMethod(L, "Player", "setStamina", PlayerFunctions::luaPlayerSetStamina);
+
+	Lua::registerMethod(L, "Player", "isTotpEnabled", PlayerFunctions::luaPlayerIsTotpEnabled);
+	Lua::registerMethod(L, "Player", "setupTotp", PlayerFunctions::luaPlayerSetupTotp);
+	Lua::registerMethod(L, "Player", "confirmTotp", PlayerFunctions::luaPlayerConfirmTotp);
+	Lua::registerMethod(L, "Player", "disableTotp", PlayerFunctions::luaPlayerDisableTotp);
 
 	Lua::registerMethod(L, "Player", "getSoul", PlayerFunctions::luaPlayerGetSoul);
 	Lua::registerMethod(L, "Player", "addSoul", PlayerFunctions::luaPlayerAddSoul);
@@ -2217,6 +2223,78 @@ int PlayerFunctions::luaPlayerSetStamina(lua_State* L) {
 	} else {
 		lua_pushnil(L);
 	}
+	return 1;
+}
+
+int PlayerFunctions::luaPlayerIsTotpEnabled(lua_State* L) {
+	// player:isTotpEnabled()
+	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
+	if (!player || !player->getAccount()) {
+		lua_pushnil(L);
+		return 1;
+	}
+	Lua::pushBoolean(L, player->getAccount()->isTotpEnabled());
+	return 1;
+}
+
+int PlayerFunctions::luaPlayerSetupTotp(lua_State* L) {
+	// player:setupTotp()
+	// Generates a new secret (not yet active - confirmTotp() must be called
+	// with a valid token first) and returns it base32-encoded, ready to be
+	// shown to the player for manual entry in an authenticator app.
+	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
+	const auto &account = player ? player->getAccount() : nullptr;
+	if (!account) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	// Stored base32-encoded (ASCII-only): accounts.totp_secret is utf8mb3,
+	// which would reject or silently corrupt the raw random secret bytes.
+	const auto encodedSecret = base32Encode(generateTotpSecret());
+	account->setTotpSecret(encodedSecret);
+	account->setTotpEnabled(false);
+	if (account->save() != AccountErrors_t::Ok) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	Lua::pushString(L, encodedSecret);
+	return 1;
+}
+
+int PlayerFunctions::luaPlayerConfirmTotp(lua_State* L) {
+	// player:confirmTotp(token)
+	const std::string token = Lua::getString(L, 2);
+	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
+	const auto &account = player ? player->getAccount() : nullptr;
+	if (!account || account->getTotpSecret().empty()) {
+		Lua::pushBoolean(L, false);
+		return 1;
+	}
+
+	if (!verifyTotpToken(account->getTotpSecret(), token)) {
+		Lua::pushBoolean(L, false);
+		return 1;
+	}
+
+	account->setTotpEnabled(true);
+	Lua::pushBoolean(L, account->save() == AccountErrors_t::Ok);
+	return 1;
+}
+
+int PlayerFunctions::luaPlayerDisableTotp(lua_State* L) {
+	// player:disableTotp()
+	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
+	const auto &account = player ? player->getAccount() : nullptr;
+	if (!account) {
+		Lua::pushBoolean(L, false);
+		return 1;
+	}
+
+	account->setTotpEnabled(false);
+	account->setTotpSecret("");
+	Lua::pushBoolean(L, account->save() == AccountErrors_t::Ok);
 	return 1;
 }
 
