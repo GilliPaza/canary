@@ -378,6 +378,8 @@ void PlayerFunctions::init(lua_State* L) {
 	Lua::registerMethod(L, "Player", "hasChaseMode", PlayerFunctions::luaPlayerHasChaseMode);
 	Lua::registerMethod(L, "Player", "hasSecureMode", PlayerFunctions::luaPlayerHasSecureMode);
 	Lua::registerMethod(L, "Player", "getFightMode", PlayerFunctions::luaPlayerGetFightMode);
+	Lua::registerMethod(L, "Player", "getPvpMode", PlayerFunctions::luaPlayerGetPvpMode);
+	Lua::registerMethod(L, "Player", "hasAttacked", PlayerFunctions::luaPlayerHasAttacked);
 
 	Lua::registerMethod(L, "Player", "getBaseXpGain", PlayerFunctions::luaPlayerGetBaseXpGain);
 	Lua::registerMethod(L, "Player", "setBaseXpGain", PlayerFunctions::luaPlayerSetBaseXpGain);
@@ -3947,6 +3949,33 @@ int PlayerFunctions::luaPlayerGetFightMode(lua_State* L) {
 	return 1;
 }
 
+int PlayerFunctions::luaPlayerGetPvpMode(lua_State* L) {
+	// player:getPvpMode()
+	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
+	if (player) {
+		lua_pushnumber(L, player->getPvpMode());
+	} else {
+		lua_pushnil(L);
+	}
+	return 1;
+}
+
+/***
+ * @function Player:hasAttacked
+ * @param targetPlayer Player
+ * @return boolean
+ */
+int PlayerFunctions::luaPlayerHasAttacked(lua_State* L) {
+	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
+	const auto &targetPlayer = Lua::getUserdataShared<Player>(L, 2, "Player");
+	if (player && targetPlayer) {
+		Lua::pushBoolean(L, player->hasAttacked(targetPlayer));
+	} else {
+		lua_pushnil(L);
+	}
+	return 1;
+}
+
 int PlayerFunctions::luaPlayerGetBaseXpGain(lua_State* L) {
 	// player:getBaseXpGain()
 	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
@@ -5097,7 +5126,7 @@ int PlayerFunctions::luaPlayerAddAchievement(lua_State* L) {
 
 	const bool success = player->achiev().add(achievementId, Lua::getBoolean(L, 3, true));
 	if (success) {
-		player->sendTakeScreenshot(SCREENSHOT_TYPE_ACHIEVEMENT);
+		player->sendTakeScreenshot(SCREENSHOT_TYPE_ACHIEVEMENT, 0, 0, g_game().getAchievementById(achievementId).name);
 	}
 
 	Lua::pushBoolean(L, success);
@@ -5257,7 +5286,7 @@ int PlayerFunctions::luaPlayerCreateTransactionSummary(lua_State* L) {
 }
 
 int PlayerFunctions::luaPlayerTakeScreenshot(lua_State* L) {
-	// player:takeScreenshot(screenshotType)
+	// player:takeScreenshot(screenshotType[, skillId = 0[, skillLevel = 0[, achievementName = ""[, raceId = 0[, bestiaryStep = 0]]]]])
 	const auto &player = Lua::getUserdataShared<Player>(L, 1, "Player");
 	if (!player) {
 		lua_pushnil(L);
@@ -5265,7 +5294,12 @@ int PlayerFunctions::luaPlayerTakeScreenshot(lua_State* L) {
 	}
 
 	const auto screenshotType = Lua::getNumber<Screenshot_t>(L, 2);
-	player->sendTakeScreenshot(screenshotType);
+	const auto skillId = Lua::getNumber<uint8_t>(L, 3, 0);
+	const auto skillLevel = Lua::getNumber<uint16_t>(L, 4, 0);
+	const auto achievementName = Lua::getString(L, 5, "");
+	const auto raceId = Lua::getNumber<uint16_t>(L, 6, 0);
+	const auto bestiaryStep = Lua::getNumber<uint8_t>(L, 7, 0);
+	player->sendTakeScreenshot(screenshotType, skillId, skillLevel, achievementName, raceId, bestiaryStep);
 	Lua::pushBoolean(L, true);
 	return 1;
 }

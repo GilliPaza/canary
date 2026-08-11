@@ -24,6 +24,7 @@
 #include "creatures/players/imbuements/imbuements.hpp"
 #include "creatures/players/storages/storages.hpp"
 #include "creatures/players/components/player_forge_history.hpp"
+#include "creatures/players/components/pvp/expert_pvp.hpp"
 #include "server/network/protocol/protocolgame.hpp"
 #include "enums/account_errors.hpp"
 #include "enums/account_group_type.hpp"
@@ -1018,7 +1019,12 @@ bool Player::hasSecureMode() const {
 }
 
 void Player::setParty(std::shared_ptr<Party> newParty) {
+	if (m_party == newParty) {
+		return;
+	}
+
 	m_party = std::move(newParty);
+	ExpertPvp::refreshAllVisibleSituationMarks();
 }
 
 std::shared_ptr<Party> Player::getParty() const {
@@ -1191,7 +1197,7 @@ void Player::addSkillAdvance(skills_t skill, uint64_t count) {
 		if (skill == SKILL_LEVEL) {
 			sendTakeScreenshot(SCREENSHOT_TYPE_LEVELUP);
 		} else {
-			sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP);
+			sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP, static_cast<uint8_t>(getCipbiaSkill(skill)), skills[skill].level);
 		}
 
 		g_creatureEvents().playerAdvance(static_self_cast<Player>(), skill, (skills[skill].level - 1), skills[skill].level);
@@ -1422,7 +1428,20 @@ bool Player::canWalkthrough(const std::shared_ptr<Creature> &creature) {
 
 	if (player) {
 		const auto &playerTile = player->getTile();
-		if (!playerTile || (!playerTile->hasFlag(TILESTATE_NOPVPZONE) && !playerTile->hasFlag(TILESTATE_PROTECTIONZONE) && player->getLevel() > static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) && g_game().getWorldType() != WORLD_TYPE_NO_PVP)) {
+		const bool legacyWalkthroughZone = playerTile && (playerTile->hasFlag(TILESTATE_NOPVPZONE) || playerTile->hasFlag(TILESTATE_PROTECTIONZONE) || player->getLevel() <= static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) || g_game().getWorldType() == WORLD_TYPE_NO_PVP);
+		if (!playerTile) {
+			return false;
+		}
+
+		if (!legacyWalkthroughZone && ExpertPvp::isEnabled()) {
+			const auto relation = ExpertPvp::classifyRelation(player, getPlayer());
+			const auto decision = ExpertPvp::canWalkThrough(relation.facts);
+			if (decision.handled) {
+				return decision.canWalkThrough;
+			}
+		}
+
+		if (!legacyWalkthroughZone) {
 			return false;
 		}
 
@@ -1470,7 +1489,16 @@ bool Player::canWalkthroughEx(const std::shared_ptr<Creature> &creature) const {
 	const auto &npc = creature->getNpc();
 	if (player) {
 		const auto &playerTile = player->getTile();
-		return playerTile && (playerTile->hasFlag(TILESTATE_NOPVPZONE) || playerTile->hasFlag(TILESTATE_PROTECTIONZONE) || player->getLevel() <= static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) || g_game().getWorldType() == WORLD_TYPE_NO_PVP);
+		const bool legacyWalkthroughZone = playerTile && (playerTile->hasFlag(TILESTATE_NOPVPZONE) || playerTile->hasFlag(TILESTATE_PROTECTIONZONE) || player->getLevel() <= static_cast<uint32_t>(g_configManager().getNumber(PROTECTION_LEVEL)) || g_game().getWorldType() == WORLD_TYPE_NO_PVP);
+		if (playerTile && !legacyWalkthroughZone && ExpertPvp::isEnabled()) {
+			const auto relation = ExpertPvp::classifyRelation(player, getPlayer());
+			const auto decision = ExpertPvp::canWalkThrough(relation.facts);
+			if (decision.handled) {
+				return decision.canWalkThrough;
+			}
+		}
+
+		return legacyWalkthroughZone;
 	} else if (npc) {
 		const auto &tile = npc->getTile();
 		const auto &houseTile = std::dynamic_pointer_cast<HouseTile>(tile);
@@ -2146,8 +2174,12 @@ void Player::sendPlayerVocation(const std::shared_ptr<Player> &player) const {
 }
 
 void Player::sendDistanceShoot(const Position &from, const Position &to, uint16_t type) const {
+	sendDistanceShoot(from, to, type, SourceEffect_t::OWN);
+}
+
+void Player::sendDistanceShoot(const Position &from, const Position &to, uint16_t type, SourceEffect_t source) const {
 	if (client) {
-		client->sendDistanceShoot(from, to, type);
+		client->sendDistanceShoot(from, to, type, source);
 	}
 }
 
@@ -2241,8 +2273,12 @@ void Player::sendGameNews() const {
 }
 
 void Player::sendMagicEffect(const Position &pos, uint16_t type) const {
+	sendMagicEffect(pos, type, SourceEffect_t::OWN);
+}
+
+void Player::sendMagicEffect(const Position &pos, uint16_t type, SourceEffect_t source) const {
 	if (client) {
-		client->sendMagicEffect(pos, type);
+		client->sendMagicEffect(pos, type, source);
 	}
 }
 
@@ -2933,6 +2969,10 @@ void Player::setNextWalkActionTask(const std::shared_ptr<Task> &task) {
 		walkTaskEvent = 0;
 	}
 
+	if (task) {
+		task->setLane(DispatcherLane::PlayerAction);
+		task->setProducerToken(getID());
+	}
 	walkTask = task;
 }
 
@@ -2943,7 +2983,13 @@ void Player::setNextWalkTask(const std::shared_ptr<Task> &task) {
 	}
 
 	if (task) {
+		task->setLane(DispatcherLane::PlayerWalk);
+		task->setProducerToken(getID());
 		nextStepEvent = g_dispatcher().scheduleEvent(task);
+		if (nextStepEvent == 0) {
+			sendCancelWalk();
+			return;
+		}
 		resetIdleTime();
 	}
 }
@@ -2959,7 +3005,13 @@ void Player::setNextActionTask(const std::shared_ptr<Task> &task, bool resetIdle
 	}
 
 	if (task) {
+		task->setLane(DispatcherLane::PlayerAction);
+		task->setProducerToken(getID());
 		actionTaskEvent = g_dispatcher().scheduleEvent(task);
+		if (actionTaskEvent == 0) {
+			sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
+			return;
+		}
 		if (resetIdleTime) {
 			this->resetIdleTime();
 		}
@@ -2973,7 +3025,12 @@ void Player::setNextActionPushTask(const std::shared_ptr<Task> &task) {
 	}
 
 	if (task) {
+		task->setLane(DispatcherLane::PlayerAction);
+		task->setProducerToken(getID());
 		actionTaskEventPush = g_dispatcher().scheduleEvent(task);
+		if (actionTaskEventPush == 0) {
+			sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
+		}
 	}
 }
 
@@ -2986,7 +3043,12 @@ void Player::setNextPotionActionTask(const std::shared_ptr<Task> &task) {
 	cancelPush();
 
 	if (task) {
+		task->setLane(DispatcherLane::PlayerAction);
+		task->setProducerToken(getID());
 		actionPotionTaskEvent = g_dispatcher().scheduleEvent(task);
+		if (actionPotionTaskEvent == 0) {
+			sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
+		}
 		// resetIdleTime();
 	}
 }
@@ -3313,8 +3375,13 @@ void Player::updateImbuementTrackerStats() const {
 					player->m_pendingImbuementTrackerEventId = 0;
 					player->updateImbuementTrackerStats();
 				},
-				__FUNCTION__
+				__FUNCTION__,
+				DispatcherLane::PlayerAction,
+				getID()
 			);
+			if (m_pendingImbuementTrackerEventId == 0) {
+				m_hasPendingImbuementTrackerUpdate = false;
+			}
 		}
 		return;
 	}
@@ -3495,10 +3562,9 @@ void Player::addManaSpent(uint64_t amount) {
 		std::ostringstream ss;
 		ss << "You advanced to magic level " << magLevel << '.';
 		sendTextMessage(MESSAGE_EVENT_ADVANCE, ss.str());
-		sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP);
+		sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP, static_cast<uint8_t>(getCipbiaSkill(SKILL_MAGLEVEL)), magLevel);
 
 		g_creatureEvents().playerAdvance(static_self_cast<Player>(), SKILL_MAGLEVEL, magLevel - 1, magLevel);
-		sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP);
 
 		sendUpdateStats = true;
 		currReqMana = nextReqMana;
@@ -3933,6 +3999,8 @@ void Player::doAttacking(uint32_t interval) {
 					creature->checkCreatureAttack(true);
 				} }, __FUNCTION__
 		);
+		task->setLane(DispatcherLane::PlayerAction);
+		task->setProducerToken(getID());
 
 		if (!classicSpeed) {
 			setNextActionTask(task, false);
@@ -4154,10 +4222,12 @@ void Player::death(const std::shared_ptr<Creature> &lastHitCreature) {
 			auto condition = *it;
 			// isSupress block to delete spells conditions (ensures that the player cannot, for example, reset the cooldown time of the familiar and summon several)
 			if (condition->isPersistent() && condition->isRemovableOnDeath()) {
+				const ConditionType_t type = condition->getType();
 				it = conditions.erase(it);
+				trackRemovedCondition(type);
 
 				condition->endCondition(static_self_cast<Player>());
-				onEndCondition(condition->getType());
+				onEndCondition(type);
 			} else {
 				++it;
 			}
@@ -4170,10 +4240,12 @@ void Player::death(const std::shared_ptr<Creature> &lastHitCreature) {
 		while (it != end) {
 			auto condition = *it;
 			if (condition->isPersistent()) {
+				const ConditionType_t type = condition->getType();
 				it = conditions.erase(it);
+				trackRemovedCondition(type);
 
 				condition->endCondition(static_self_cast<Player>());
-				onEndCondition(condition->getType());
+				onEndCondition(type);
 			} else {
 				++it;
 			}
@@ -4350,6 +4422,51 @@ std::shared_ptr<Item> Player::getCorpse(const std::shared_ptr<Creature> &lastHit
 	return corpse;
 }
 
+void Player::addPzLockTicks() {
+	if (hasFlag(PlayerFlags_t::NotGainInFight)) {
+		return;
+	}
+
+	const auto duration = static_cast<uint32_t>(g_configManager().getNumber(PZ_LOCKED));
+	const auto expiresAt = OTSYS_TIME() + duration;
+	if (pzLockOnlyUntil >= expiresAt) {
+		return;
+	}
+
+	pzLockOnlyUntil = expiresAt;
+	pzLocked = true;
+	sendIcons();
+	if (pzLockEventId != 0) {
+		g_dispatcher().stopEvent(pzLockEventId);
+	}
+
+	const auto &task = createPlayerTask(
+		duration,
+		[playerId = getID()] {
+			const auto &player = g_game().getPlayerByID(playerId);
+			if (!player) {
+				return;
+			}
+
+			player->pzLockEventId = 0;
+			if (player->hasCondition(CONDITION_INFIGHT) || player->pzLockOnlyUntil > OTSYS_TIME()) {
+				return;
+			}
+
+			player->pzLockOnlyUntil = 0;
+			if (player->pzLocked) {
+				player->pzLocked = false;
+				player->sendIcons();
+			}
+			if (player->getSkull() != SKULL_RED && player->getSkull() != SKULL_BLACK) {
+				player->setSkull(SKULL_NONE);
+			}
+		},
+		__FUNCTION__
+	);
+	pzLockEventId = g_dispatcher().scheduleEvent(task);
+}
+
 void Player::addInFightTicks(bool pzlock /*= false*/) {
 	wheel().checkAbilities();
 
@@ -4358,6 +4475,7 @@ void Player::addInFightTicks(bool pzlock /*= false*/) {
 	}
 
 	if (pzlock) {
+		pzLockOnlyUntil = 0;
 		pzLocked = true;
 		sendIcons();
 	}
@@ -5879,9 +5997,9 @@ void Player::getAllItemTypeCountAndSubtype(std::map<uint32_t, uint32_t> &countMa
 	}
 }
 
-std::shared_ptr<Item> Player::getForgeItemFromId(uint16_t itemId, uint8_t tier) const {
+std::shared_ptr<Item> Player::getForgeItemFromId(uint16_t itemId, uint8_t tier, const std::shared_ptr<Item> &exclude /*= nullptr*/) const {
 	for (const auto &item : getAllInventoryItems(true)) {
-		if (!item) {
+		if (!item || item == exclude) {
 			continue;
 		}
 		if (item->hasImbuements()) {
@@ -6092,6 +6210,14 @@ void Player::setSecureMode(bool mode) {
 	secureMode = mode;
 }
 
+void Player::setPvpMode(PvpMode_t mode) {
+	(void)m_pvpPlayer.setMode(mode);
+}
+
+PvpMode_t Player::getPvpMode() const {
+	return m_pvpPlayer.getMode();
+}
+
 Faction_t Player::getFaction() const {
 	return faction;
 }
@@ -6121,7 +6247,12 @@ void Player::onWalkComplete() {
 	}
 
 	if (walkTask) {
+		walkTask->setLane(DispatcherLane::PlayerAction);
+		walkTask->setProducerToken(getID());
 		walkTaskEvent = g_dispatcher().scheduleEvent(walkTask);
+		if (walkTaskEvent == 0) {
+			sendCancelMessage(RETURNVALUE_NOTPOSSIBLE);
+		}
 		walkTask = nullptr;
 	}
 }
@@ -6267,11 +6398,17 @@ void Player::onEndCondition(ConditionType_t type) {
 	const auto &conditionFight = getCondition(CONDITION_INFIGHT);
 	if (type == CONDITION_INFIGHT && !conditionFight) {
 		onIdleStatus();
-		pzLocked = false;
+		const bool hasPzLockOnly = pzLockOnlyUntil > OTSYS_TIME();
+		if (hasPzLockOnly) {
+			pzLocked = true;
+		} else {
+			pzLockOnlyUntil = 0;
+			pzLocked = false;
+		}
 		clearAttacked();
 		sendOpenPvpSituations();
 
-		if (getSkull() != SKULL_RED && getSkull() != SKULL_BLACK) {
+		if (!hasPzLockOnly && getSkull() != SKULL_RED && getSkull() != SKULL_BLACK) {
 			setSkull(SKULL_NONE);
 		}
 	}
@@ -6336,7 +6473,7 @@ void Player::onAttackedCreature(const std::shared_ptr<Creature> &target) {
 	}
 
 	const auto &targetPlayer = target->getPlayer();
-	if (targetPlayer && !isPartner(targetPlayer) && !isGuildMate(targetPlayer)) {
+	if (targetPlayer && !ExpertPvp::isEnabled() && !isPartner(targetPlayer) && !isGuildMate(targetPlayer)) {
 		if (!pzLocked && g_game().getWorldType() == WORLD_TYPE_PVP_ENFORCED) {
 			pzLocked = true;
 			sendIcons();
@@ -6453,7 +6590,7 @@ bool Player::onKilledPlayer(const std::shared_ptr<Player> &target, bool lastHit)
 				for (auto &kill : target->unjustifiedKills) {
 					if (kill.target == getGUID() && kill.unavenged) {
 						kill.unavenged = false;
-						attackedSet.erase(target->guid);
+						removeAttacked(target);
 						break;
 					}
 				}
@@ -7061,12 +7198,24 @@ bool Player::hasAttacked(const std::shared_ptr<Player> &attacked) const {
 	return attackedSet.contains(attacked->guid);
 }
 
+const phmap::flat_hash_set<uint32_t> &Player::getAttackedPlayerGuids() const {
+	return attackedSet;
+}
+
+const phmap::flat_hash_set<uint32_t> &Player::getAttackerPlayerGuids() const {
+	return attackerSet;
+}
+
 void Player::addAttacked(const std::shared_ptr<Player> &attacked) {
 	if (hasFlag(PlayerFlags_t::NotGainInFight) || !attacked || attacked == getPlayer()) {
 		return;
 	}
 
-	attackedSet.emplace(attacked->guid);
+	const auto [iterator, inserted] = attackedSet.emplace(attacked->guid);
+	(void)iterator;
+	if (inserted) {
+		(void)attacked->attackerSet.emplace(guid);
+	}
 }
 
 void Player::removeAttacked(const std::shared_ptr<Player> &attacked) {
@@ -7074,11 +7223,27 @@ void Player::removeAttacked(const std::shared_ptr<Player> &attacked) {
 		return;
 	}
 
-	attackedSet.erase(attacked->guid);
+	if (attackedSet.erase(attacked->guid) == 0) {
+		return;
+	}
+
+	(void)attacked->attackerSet.erase(guid);
+	if (ExpertPvp::isEnabled()) {
+		ExpertPvp::refreshVisibleSituationMarks(static_self_cast<Player>(), attacked);
+	}
 }
 
 void Player::clearAttacked() {
+	const bool shouldRefreshExpertMarks = ExpertPvp::isEnabled() && !attackedSet.empty();
+	for (const auto attackedGuid : attackedSet) {
+		if (const auto &attacked = g_game().getPlayerByGUID(attackedGuid)) {
+			(void)attacked->attackerSet.erase(guid);
+		}
+	}
 	attackedSet.clear();
+	if (shouldRefreshExpertMarks) {
+		ExpertPvp::refreshAllVisibleSituationMarks();
+	}
 }
 
 void Player::addUnjustifiedDead(const std::shared_ptr<Player> &attacked) {
@@ -7187,7 +7352,7 @@ double Player::getLostPercent() const {
 		return std::max<int32_t>(0, deathLosePercent) / 100.;
 	}
 
-	bool isRetro = g_configManager().getBoolean(TOGGLE_SERVER_IS_RETRO);
+	bool isRetro = ExpertPvp::isRetroPvpWorldType();
 	const auto factor = (isRetro ? 6.31 : 8);
 	double percentReduction = (blessingCount * factor) / 100.;
 
@@ -7996,7 +8161,7 @@ bool Player::addOfflineTrainingTries(skills_t skill, uint64_t tries) {
 			std::ostringstream ss;
 			ss << "You advanced to magic level " << magLevel << '.';
 			sendTextMessage(MESSAGE_EVENT_ADVANCE, ss.str());
-			sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP);
+			sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP, static_cast<uint8_t>(getCipbiaSkill(SKILL_MAGLEVEL)), magLevel);
 		}
 
 		uint8_t newPercent;
@@ -8056,7 +8221,7 @@ bool Player::addOfflineTrainingTries(skills_t skill, uint64_t tries) {
 			if (skill == SKILL_LEVEL) {
 				sendTakeScreenshot(SCREENSHOT_TYPE_LEVELUP);
 			} else {
-				sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP);
+				sendTakeScreenshot(SCREENSHOT_TYPE_SKILLUP, static_cast<uint8_t>(getCipbiaSkill(skill)), skills[skill].level);
 			}
 		}
 
@@ -8368,9 +8533,9 @@ void Player::sendOpenStash(bool isNpc) const {
 	}
 }
 
-void Player::sendTakeScreenshot(Screenshot_t screenshotType) const {
+void Player::sendTakeScreenshot(Screenshot_t screenshotType, uint8_t skillId, uint16_t skillLevel, const std::string &achievementName, uint16_t raceId, uint8_t bestiaryStep) const {
 	if (client) {
-		client->sendTakeScreenshot(screenshotType);
+		client->sendTakeScreenshot(screenshotType, skillId, skillLevel, achievementName, raceId, bestiaryStep);
 	}
 }
 
@@ -8670,6 +8835,12 @@ void Player::sendPrivateMessage(const std::shared_ptr<Player> &speaker, SpeakCla
 void Player::sendCreatureSquare(const std::shared_ptr<Creature> &creature, SquareColor_t color) const {
 	if (client) {
 		client->sendCreatureSquare(creature, color);
+	}
+}
+
+void Player::sendCreatureMark(const std::shared_ptr<Creature> &creature, CreatureMark_t mark) const {
+	if (client) {
+		client->sendCreatureMark(creature, mark);
 	}
 }
 
@@ -9075,6 +9246,7 @@ void Player::setGuild(const std::shared_ptr<Guild> &newGuild) {
 		return;
 	}
 
+	const auto oldGuild = guild;
 	if (guild) {
 		guild->removeMember(static_self_cast<Player>());
 		guild = nullptr;
@@ -9086,12 +9258,19 @@ void Player::setGuild(const std::shared_ptr<Guild> &newGuild) {
 	if (newGuild) {
 		const auto &rank = newGuild->getRankByLevel(1);
 		if (!rank) {
+			if (oldGuild != guild) {
+				ExpertPvp::refreshAllVisibleSituationMarks();
+			}
 			return;
 		}
 
 		guild = newGuild;
 		guildRank = rank;
 		newGuild->addMember(static_self_cast<Player>());
+	}
+
+	if (oldGuild != guild) {
+		ExpertPvp::refreshAllVisibleSituationMarks();
 	}
 }
 
@@ -10260,7 +10439,14 @@ void Player::initializeTaskHunting() {
 		}
 	}
 
-	if (client && g_configManager().getBoolean(TASK_HUNTING_ENABLED) && !client->oldProtocol) {
+	const auto* protocolProfile = client ? client->getProtocolProfile() : nullptr;
+	const bool usesOfficialTaskboardPackets = protocolProfile
+		&& protocolProfile->hasFeature(ProtocolFeature::OfficialTaskboardPackets);
+	const bool canSendLegacyTaskHuntingBaseData = client
+		&& g_configManager().getBoolean(TASK_HUNTING_ENABLED)
+		&& !client->oldProtocol
+		&& !usesOfficialTaskboardPackets;
+	if (canSendLegacyTaskHuntingBaseData) {
 		auto buffer = g_ioprey().getTaskHuntingBaseDate();
 		client->writeToOutputBuffer(buffer);
 	}
@@ -10968,7 +11154,16 @@ void Player::triggerTranscendence() {
 			},
 			__FUNCTION__
 		);
-		[[maybe_unused]] auto eventId = g_dispatcher().scheduleEvent(task);
+		task->setLane(DispatcherLane::PlayerAction);
+		task->setProducerToken(getID());
+		auto eventId = g_dispatcher().scheduleEvent(task);
+		if (eventId == 0) {
+			task->setLane(DispatcherLane::Maintenance);
+			eventId = g_dispatcher().scheduleEvent(task);
+			if (eventId == 0) {
+				g_logger().warn("[Player::triggerTranscendence] Failed to schedule the post-transcendence refresh for player {}", getName());
+			}
+		}
 
 		wheel().sendGiftOfLifeCooldown();
 		g_game().reloadCreature(getPlayer());
@@ -10994,7 +11189,7 @@ void Player::forgeFuseItems(ForgeAction_t actionType, uint16_t firstItemId, uint
 		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
 		return;
 	}
-	const auto &secondForgingItem = getForgeItemFromId(secondItemId, tier);
+	const auto &secondForgingItem = getForgeItemFromId(secondItemId, tier, firstForgingItem);
 	if (!secondForgingItem) {
 		g_logger().error("[Log 2] Player with name {} failed to fuse item with id {}", getName(), secondItemId);
 		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
@@ -11290,7 +11485,7 @@ void Player::forgeTransferItemTier(ForgeAction_t actionType, uint16_t donorItemI
 		return;
 	}
 
-	const auto &receiveItem = getForgeItemFromId(receiveItemId, 0);
+	const auto &receiveItem = getForgeItemFromId(receiveItemId, 0, donorItem);
 	if (!receiveItem) {
 		g_logger().error("[Log 2] Player with name {} failed to transfer item with id {}", getName(), receiveItemId);
 		sendForgeError(RETURNVALUE_CONTACTADMINISTRATOR);
@@ -11961,8 +12156,24 @@ void Player::onCreatureAppear(const std::shared_ptr<Creature> &creature, bool is
 			bed->wakeUp(static_self_cast<Player>());
 		}
 
-		auto version = client->oldProtocol ? getProtocolVersion() : CLIENT_VERSION;
-		g_logger().info("{} has logged in. (Protocol: {})", name, version);
+		auto version = client && client->oldProtocol ? getProtocolVersion() : CLIENT_VERSION;
+		const auto* protocolProfile = client ? client->getProtocolProfile() : nullptr;
+		if (protocolProfile
+		    && (protocolProfile->assetSignatures.dat != 0 || protocolProfile->assetSignatures.spr != 0 || protocolProfile->assetSignatures.pic != 0)) {
+			g_logger().info(
+				"{} has logged in. (Protocol: {}, Profile: {}, Assets: dat=0x{:08X} spr=0x{:08X} pic=0x{:08X})",
+				name,
+				version,
+				protocolProfile->name,
+				protocolProfile->assetSignatures.dat,
+				protocolProfile->assetSignatures.spr,
+				protocolProfile->assetSignatures.pic
+			);
+		} else if (protocolProfile) {
+			g_logger().info("{} has logged in. (Protocol: {}, Profile: {})", name, version, protocolProfile->name);
+		} else {
+			g_logger().info("{} has logged in. (Protocol: {})", name, version);
+		}
 
 		std::string livestreamPassword;
 		if (auto passwordValue = kv()->scoped("livestream-system")->get("password")) {
@@ -12296,12 +12507,15 @@ bool Player::canAutoWalk(const Position &toPosition, const std::function<void()>
 		// Check if can walk to the toPosition and send event to use function
 		std::vector<Direction> listDir;
 		if (getPathTo(toPosition, listDir, 0, 1, true, true)) {
-			g_dispatcher().addEvent([creatureId = getID(), listDir] { g_game().playerAutoWalk(creatureId, listDir); }, __FUNCTION__);
+			if (!g_game().queuePlayerAutoWalk(getID(), std::move(listDir))) {
+				return true;
+			}
 			const auto &task = createPlayerTask(delay, function, __FUNCTION__);
 			setNextWalkActionTask(task);
 			return true;
 		} else {
 			sendCancelMessage(RETURNVALUE_THEREISNOWAY);
+			return true;
 		}
 	}
 	return false;
@@ -12947,15 +13161,17 @@ Virtue_t Player::getVirtue() const {
 	return virtue;
 }
 
-void Player::setVirtue(Virtue_t newVirtue) {
+void Player::setVirtue(Virtue_t newVirtue, bool notifyClient /* = true */) {
 	if (virtue == newVirtue) {
 		return;
 	}
 
 	virtue = newVirtue;
 
-	sendSkills();
-	sendMonkData(MonkData_t::Virtue, enumToValue(virtue));
+	if (notifyClient) {
+		sendSkills();
+		sendMonkData(MonkData_t::Virtue, enumToValue(virtue));
+	}
 }
 
 void Player::setSerene(bool b, int32_t ticks /* = -1 */) {
